@@ -9,7 +9,6 @@ import (
 	"os"
 	"sync"
 
-	jsonpatch "gomodules.xyz/jsonpatch/v2"
 	v1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -158,8 +157,8 @@ func mutatePods(ctx context.Context, req *v1.AdmissionReview) *v1.AdmissionRespo
 	patch, err := json.Marshal([]map[string]interface{}{
 		{
 			"op":    "add",
-			"path":  "/metadata/labels/env",
-			"value": "dev",
+			"path":  "/spec/hostAliases",
+			"value": hostAliases,
 		},
 	})
 	if err != nil {
@@ -170,7 +169,7 @@ func mutatePods(ctx context.Context, req *v1.AdmissionReview) *v1.AdmissionRespo
 		}
 	}
 
-	return &v1.AdmissionResponse{
+	r := &v1.AdmissionResponse{
 		Allowed: true,
 		Patch:   patch,
 		PatchType: func() *v1.PatchType {
@@ -179,40 +178,42 @@ func mutatePods(ctx context.Context, req *v1.AdmissionReview) *v1.AdmissionRespo
 		}(),
 	}
 
-	resp, err := json.Marshal(pod)
-	if err != nil {
-		return &v1.AdmissionResponse{
-			Result: &metav1.Status{
-				Message: err.Error(),
-			},
-		}
-	}
-	patches, err := jsonpatch.CreatePatch(req.Request.Object.Raw, resp)
-	if err != nil {
-		return &v1.AdmissionResponse{
-			Result: &metav1.Status{
-				Message: err.Error(),
-			},
-		}
-	}
-
-	patchBytes := make([]byte, 0)
-	for _, p := range patches {
-		b, _ := p.MarshalJSON()
-		patchBytes = append(patchBytes, b...)
-	}
-
-	return &v1.AdmissionResponse{
-		Allowed: true,
-		Patch:   patchBytes,
-		PatchType: func() *v1.PatchType {
-			if len(patches) == 0 {
-				return nil
-			}
-			pt := v1.PatchTypeJSONPatch
-			return &pt
-		}(),
-	}
+	return r
+	//
+	//resp, err := json.Marshal(pod)
+	//if err != nil {
+	//	return &v1.AdmissionResponse{
+	//		Result: &metav1.Status{
+	//			Message: err.Error(),
+	//		},
+	//	}
+	//}
+	//patches, err := jsonpatch.CreatePatch(req.Request.Object.Raw, resp)
+	//if err != nil {
+	//	return &v1.AdmissionResponse{
+	//		Result: &metav1.Status{
+	//			Message: err.Error(),
+	//		},
+	//	}
+	//}
+	//
+	//patchBytes := make([]byte, 0)
+	//for _, p := range patches {
+	//	b, _ := p.MarshalJSON()
+	//	patchBytes = append(patchBytes, b...)
+	//}
+	//
+	//return &v1.AdmissionResponse{
+	//	Allowed: true,
+	//	Patch:   patchBytes,
+	//	PatchType: func() *v1.PatchType {
+	//		if len(patches) == 0 {
+	//			return nil
+	//		}
+	//		pt := v1.PatchTypeJSONPatch
+	//		return &pt
+	//	}(),
+	//}
 }
 
 func handleMutatePod(w http.ResponseWriter, r *http.Request) {
