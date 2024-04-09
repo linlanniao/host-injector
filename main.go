@@ -9,9 +9,11 @@ import (
 	"os"
 	"sync"
 
+	"gomodules.xyz/jsonpatch/v2"
 	v1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -79,8 +81,8 @@ func client() *kubernetes.Clientset {
 	return _cli
 }
 
-func getHostAliasesFromServices() ([]corev1.HostAlias, error) {
-	services, err := client().CoreV1().Services("").List(context.Background(), metav1.ListOptions{})
+func getHostAliasesFromServices(ctx context.Context) ([]corev1.HostAlias, error) {
+	services, err := client().CoreV1().Services("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -111,109 +113,94 @@ func getHostAliasesFromServices() ([]corev1.HostAlias, error) {
 	return hostAliases, nil
 }
 
-func mutatePods(ctx context.Context, req *v1.AdmissionReview) *v1.AdmissionResponse {
-	// Assuming the incoming request is of kind Pod
-	pod := corev1.Pod{}
-	if err := json.Unmarshal(req.Request.Object.Raw, &pod); err != nil {
-		return &v1.AdmissionResponse{
-			Result: &metav1.Status{
-				Message: err.Error(),
-			},
-		}
-	}
-
-	if !isWatching(&pod) {
-		return &v1.AdmissionResponse{
-			Allowed: true,
-			Result: &metav1.Status{
-				Message: "Pod is not watching",
-			},
-		}
-	}
-
-	hostAliases, err := getHostAliasesFromServices()
-	if err != nil {
-		return &v1.AdmissionResponse{Warnings: []string{
-			fmt.Sprintf("Failed to get host aliases: %s", err.Error()),
-		}}
-	}
-
-	if len(hostAliases) == 0 {
-		return &v1.AdmissionResponse{
-			Allowed: true,
-			Result: &metav1.Status{
-				Message: "No host aliases found",
-			},
-		}
-	}
-
-	//if pod.Spec.HostAliases == nil {
-	//	pod.Spec.HostAliases = make([]corev1.HostAlias, 0, len(hostAliases))
-	//}
-	//for _, hostAlias := range hostAliases {
-	//	pod.Spec.HostAliases = append(pod.Spec.HostAliases, hostAlias)
-	//}
-
-	patch, err := json.Marshal([]map[string]interface{}{
-		{
-			"op":    "add",
-			"path":  "/spec/hostAliases",
-			"value": hostAliases,
+func responseErrored(uid types.UID, code int32, err error) *v1.AdmissionResponse {
+	return &v1.AdmissionResponse{
+		UID:     uid,
+		Allowed: false,
+		Result: &metav1.Status{
+			Code:    code,
+			Message: err.Error(),
 		},
-	})
+	}
+}
+
+func responseAllowed(uid types.UID, msg string) *v1.AdmissionResponse {
+	return &v1.AdmissionResponse{
+		UID:     uid,
+		Allowed: true,
+		Result: &metav1.Status{
+			Message: msg,
+		},
+	}
+}
+
+func patchResponseFromRaw(uid types.UID, original, current []byte) *v1.AdmissionResponse {
+	patches, err := jsonpatch.CreatePatch(original, current)
 	if err != nil {
-		return &v1.AdmissionResponse{
-			Result: &metav1.Status{
-				Message: err.Error(),
-			},
-		}
+		return responseErrored(uid, http.StatusInternalServerError, err)
 	}
 
-	r := &v1.AdmissionResponse{
+	patchBytes := make([]byte, 0)
+	for _, p := range patches {
+		b, err := p.MarshalJSON()
+		if err != nil {
+			return responseErrored(uid, http.StatusInternalServerError, err)
+		}
+		patchBytes = append(patchBytes, b...)
+	}
+
+	return &v1.AdmissionResponse{
+		UID:     uid,
 		Allowed: true,
-		Patch:   patch,
+		Patch:   patchBytes,
 		PatchType: func() *v1.PatchType {
+			if len(patches) == 0 {
+				return nil
+			}
 			pt := v1.PatchTypeJSONPatch
 			return &pt
 		}(),
 	}
+}
 
+func mutatePods(ctx context.Context, req *v1.AdmissionReview) (response *v1.AdmissionResponse) {
+	uid := req.Request.UID
+
+	// Assuming the incoming request is of kind Pod
+	pod := corev1.Pod{}
+	if err := json.Unmarshal(req.Request.Object.Raw, &pod); err != nil {
+		responseErrored(uid, http.StatusBadRequest, err)
+	}
+
+	if !isWatching(&pod) {
+		return responseAllowed(uid, "Pod is not watching")
+	}
+
+	hostAliases, err := getHostAliasesFromServices(ctx)
+	if err != nil {
+		err = fmt.Errorf("failed to get host aliases: %w", err)
+		return responseErrored(uid, http.StatusInternalServerError, err)
+	}
+
+	if len(hostAliases) == 0 {
+		return responseAllowed(uid, "No host aliases found")
+	}
+
+	if pod.Spec.HostAliases == nil {
+		pod.Spec.HostAliases = make([]corev1.HostAlias, 0, len(hostAliases))
+	}
+	for _, hostAlias := range hostAliases {
+		pod.Spec.HostAliases = append(pod.Spec.HostAliases, hostAlias)
+	}
+
+	resp, err := json.Marshal(pod)
+	if err != nil {
+		return responseErrored(uid, http.StatusInternalServerError, err)
+	}
+
+	r := patchResponseFromRaw(uid, req.Request.Object.Raw, resp)
 	return r
-	//
-	//resp, err := json.Marshal(pod)
-	//if err != nil {
-	//	return &v1.AdmissionResponse{
-	//		Result: &metav1.Status{
-	//			Message: err.Error(),
-	//		},
-	//	}
-	//}
-	//patches, err := jsonpatch.CreatePatch(req.Request.Object.Raw, resp)
-	//if err != nil {
-	//	return &v1.AdmissionResponse{
-	//		Result: &metav1.Status{
-	//			Message: err.Error(),
-	//		},
-	//	}
-	//}
-	//
-	//patchBytes := make([]byte, 0)
-	//for _, p := range patches {
-	//	b, _ := p.MarshalJSON()
-	//	patchBytes = append(patchBytes, b...)
-	//}
-	//
-	//return &v1.AdmissionResponse{
-	//	Allowed: true,
-	//	Patch:   patchBytes,
-	//	PatchType: func() *v1.PatchType {
-	//		if len(patches) == 0 {
-	//			return nil
-	//		}
-	//		pt := v1.PatchTypeJSONPatch
-	//		return &pt
-	//	}(),
-	//}
+
 }
 
 func handleMutatePod(w http.ResponseWriter, r *http.Request) {
